@@ -1,0 +1,177 @@
+---
+title: "V1 DSP vs TOP Analysis"
+author: "Lorenzo Tubertini"
+date: "17 April 2018"
+output:
+  github_document:
+    dev: jpeg
+    toc: true
+    toc_depth: 3
+
+---
+
+## R code to prepare the V1 DSP vs TOP Analysis
+
+### Libraries load, MongoDB data import and consolidation
+CSV files from the original case can be found [here](https://github.com/ltubertini/DSP_TOP/tree/master/case)
+
+```{r data import, echo=TRUE, warning=FALSE, tidy=TRUE, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(vcd)
+
+setwd('C:/Users/ltubertini/Downloads/case')
+a <- (read.csv2('case.csv', sep=";", na.strings = "-",dec=',', skip=1,
+               colClasses=c("character","character","numeric","numeric","numeric","numeric","numeric","numeric","numeric","numeric","numeric","numeric","numeric","numeric")))
+b <- (read.csv2('case2.csv', sep=";", na.strings = "-",dec=',', skip=1,
+               colClasses=c("character","character","numeric")))
+
+input <- merge(a, b, by=c("ad_id","dealer_id"), all=T)
+input <- input %>%
+  group_by(ad_id,dealer_id) %>%
+  summarise_all(sum)
+```
+
+### Ad type bucketing, subsetting
+Ads are bucketed as "DSP", "TOP"" or both ("multi") based on the available flags for readibility.
+Ads which were not served via either are removed as well as those living longer than 6 days to reduce noise from external traffic.
+
+```{r data bucketing, echo=TRUE, warning=FALSE, tidy=TRUE, message=FALSE}
+input$ad_type <- ifelse(input$TOP.feature.ads==1 & input$DSS.feature.flag==1,"multi",
+                       ifelse(input$TOP.feature.ads==1 & input$DSS.feature.flag==0,"TOP",
+                              ifelse(input$TOP.feature.ads==0 & input$DSS.feature.flag==1,"DSP","none")))
+input_no_none <- subset(input, ad_type!="none")
+input <- subset(input_no_none, ad_days<7)
+```
+
+### Dealers' ads distribution Chi-square test
+The representation of dealers between DSP and TOP ads is checked: the 2 distributions correlate with strengh approx 20%
+
+```{r dealer distribution chi-test, echo=TRUE, warning=FALSE, tidy=TRUE, message=FALSE}
+dealers <- input[,c("dealer_id","ad_type")]
+dealers <- melt(dealers)
+dealers_cast <- dcast(dealers, dealer_id ~ ad_type)
+dealers_cast <- dealers_cast[,-1]
+#Chi-square test
+chisq.test(dealers_cast)
+#Cramér's V
+assocstats(table(dealers_cast$DSP, dealers_cast$TOP))
+```
+
+### KPI calculation
+TOP adVIPs are adjusted to 30% of their actual value to compensate for the extra traffic such placement received
+
+```{r KPI calculation, echo=TRUE, warning=FALSE, tidy=TRUE, message=FALSE}
+input$TOPadVIPadj <- input$vipViews_TopFeature * 0.3
+input$adVIP <- (input$TOPadVIPadj+input$vipViews_DSPtestFeature)
+input$ad_days_DSP_TOP <- (input$TopFeature_days+input$DSPtestFeature_days)
+input$adVIP_day <- input$adVIP/input$ad_days_DSP_TOP
+input$totVIP_day <- input$vipViews_siteGermany/input$ad_days
+input$adVIP_ad <- input$adVIP/(input$TOP.feature.ads+input$DSS.feature.flag)
+input$totVIP_ad <- input$vipViews_siteGermany/(input$TOP.feature.ads+input$DSS.feature.flag)
+```
+
+### Outliers detection, exclusion
+Outliers are calculated as data point exceeding the 999th permille on at least one for the main KPIs and excluded
+
+```{r KPI outliers, echo=TRUE, warning=FALSE, tidy=TRUE, message=FALSE}
+outlier_threshold = 0.999
+outlier_adVIP_day <- subset(input, adVIP_day>quantile(input$adVIP_day, outlier_threshold, na.rm = TRUE))
+outlier_totVIP_day <- subset(input, totVIP_day>quantile(input$totVIP_day, outlier_threshold, na.rm = TRUE))
+outlier_adVIP_ad <- subset(input, adVIP_ad>quantile(input$adVIP_ad, outlier_threshold, na.rm = TRUE))
+outlier_totVIP_ad <- subset(input, totVIP_ad>quantile(input$totVIP_ad, outlier_threshold, na.rm = TRUE))
+outlier_adVIP <- subset(input, adVIP>quantile(input$adVIP_day, outlier_threshold, na.rm = TRUE))
+outlier_totVIP <- subset(input, TOPadVIPadj>quantile(input$totVIP_day, outlier_threshold, na.rm = TRUE))
+outliers <- rbind(outlier_adVIP_day, outlier_totVIP_day, outlier_adVIP_ad, outlier_totVIP_ad, outlier_adVIP, outlier_totVIP)
+input_clean <- anti_join(input, outliers, by=c("ad_id","dealer_id"))
+```
+
+### F-test in preparation for possible Student t-test
+F-test is run to test for variance equality, a condition of the Student t-test, which would help comparing KPI distributions.
+As the null hypothesis is rejected, variances aren't equal and the t-test cannot be performed
+
+```{r F-test, echo=TRUE, warning=FALSE, tidy=TRUE, message=FALSE}
+input_clean_TOP <-  subset(input_clean, ad_type=="TOP") 
+input_clean_TOP <- input_clean_TOP[,c("vipViews_siteGermany", "adVIP", "adVIP_day", "totVIP_day", "adVIP_ad", "totVIP_ad")]
+input_clean_DSP <-  subset(input_clean, ad_type=="DSP") 
+input_clean_DSP <- input_clean_DSP[,c("vipViews_siteGermany", "adVIP", "adVIP_day", "totVIP_day", "adVIP_ad", "totVIP_ad")]
+#F-test 1
+var.test(input_clean_TOP$vipViews_siteGermany,input_clean_DSP$vipViews_siteGermany)
+#F-test 2
+var.test(input_clean_TOP$adVIP,input_clean_DSP$adVIP)
+```
+
+### KPI average comparison
+These values are to be taken as preliminary and only operational
+
+```{r KPI avg comparison, echo=TRUE, warning=FALSE, tidy=TRUE, message=FALSE}
+input_compare <- input_clean[,c("ad_type", "adVIP_day", "totVIP_day", "adVIP_ad", "totVIP_ad")] %>%
+  group_by(ad_type) %>%
+  summarise_all(mean)
+```
+```{r KPI avg table, echo=FALSE, warning=FALSE, tidy=TRUE, message=FALSE}
+library(knitr)
+kable(input_compare, caption="Result")
+```
+
+## Plots:
+
+### adVIP ~ totVIP (chart 1)
+
+```{r chart 1, echo=FALSE, warning=FALSE, tidy=TRUE, message=FALSE}
+ggplot(subset(input_clean), aes(x=adVIP, y=vipViews_siteGermany, color=ad_type))+
+  geom_point()+
+  stat_smooth(method='lm', formula=y~x)
+```
+
+### Days displayed ~ totVIP (chart 2)
+
+```{r chart 2, echo=FALSE, warning=FALSE, tidy=TRUE, message=FALSE}
+ggplot(subset(input_clean), aes(x=ad_days_DSP_TOP, y=vipViews_siteGermany, color=ad_type))+
+  geom_point()+
+  stat_smooth(method='lm', formula=y~x)
+```
+
+### Days displayed ~ totVIP - DSP (chart 3)
+
+```{r chart 3, echo=FALSE, warning=FALSE, tidy=TRUE, message=FALSE}
+ggplot(subset(input_clean, ad_type=="DSP"), aes(x=ad_days_DSP_TOP, y=vipViews_siteGermany, group = cut_width(ad_days_DSP_TOP, 1)))+
+  geom_boxplot(outlier.colour="red", outlier.shape=8, outlier.size=4)+
+  coord_cartesian(ylim = c(0, 1000))
+```
+
+### Days displayed ~ totVIP - TOP (chart 4)
+
+```{r chart 4, echo=FALSE, warning=FALSE, tidy=TRUE, message=FALSE}
+ggplot(subset(input_clean, ad_type=="TOP"), aes(x=ad_days_DSP_TOP, y=vipViews_siteGermany, group = cut_width(ad_days_DSP_TOP, 1)))+
+  geom_boxplot(outlier.colour="red", outlier.shape=8, outlier.size=4)+
+  coord_cartesian(ylim = c(0, 1000))
+```
+
+### Lightbox views ~ totVIP (chart 5)
+
+```{r chart 5, echo=FALSE, warning=FALSE, tidy=TRUE, message=FALSE}
+ggplot(subset(input_clean, ad_type=="DSP"), aes(x=DSP.lightbox.views, y=vipViews_siteGermany, color=ad_type))+
+  geom_point()+
+  stat_smooth(method='lm', formula=y~x)+
+  facet_wrap(~ad_days, scales='free')
+```
+
+### Lightbox views ~ totVIP by ad days (chart 6)
+
+```{r chart 6, echo=FALSE, warning=FALSE, tidy=TRUE, message=FALSE}
+ggplot(subset(input_clean, ad_type!="multi"), aes(x=DSPdelivery, y=adVIP, color=ad_type))+
+  geom_point()+
+  stat_smooth(method='lm', formula=y~x)+
+  facet_wrap(~ad_days, scales='free')
+```
+
+### adVIP ~ totVIP by ad days (chart 7)
+
+```{r chart 7, echo=FALSE, warning=FALSE, tidy=TRUE, message=FALSE}
+ggplot(subset(input_clean, ad_type!="multi"), aes(x=adVIP, y=vipViews_siteGermany, color=ad_type))+
+  geom_point()+
+  stat_smooth(method='lm', formula=y~x)+
+  facet_wrap(~ad_days_DSP_TOP, scales='free')
+```
